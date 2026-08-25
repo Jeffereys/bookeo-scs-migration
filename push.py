@@ -27,6 +27,7 @@ already-passed bookings in SCS.
 
 import sys
 import os
+from collections import defaultdict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bookeo"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Reserve"))
@@ -37,6 +38,19 @@ from id_map import IdMap
 
 class PushError(Exception):
     """Raised for expected push failures (e.g. no matching SCS slot)."""
+
+
+class MergeConflict(Exception):
+    """
+    Raised by push_merged_booking() when a same-contact-same-time booking
+    group (see run_push) is only partially migrated, or migrated under
+    different confirmation numbers -- meaning at least one constituent
+    booking already has its own separate SCS reservation from before merge
+    support existed, possibly already converted to permanent/staff-visible.
+    Resolving that means cancelling/replacing an existing reservation,
+    which this function will never do automatically -- it raises instead
+    of writing anything, so a human can decide.
+    """
 
 
 def find_reservation_code(reservations_api, transformed, max_results=20, max_assets_to_try=8):
@@ -132,6 +146,87 @@ def push_booking(reservations_api, id_map, transformed):
     return booked
 
 
+def push_merged_booking(reservations_api, id_map, transformed_list):
+    """
+    Push a group of Bookeo bookings that share the same guest contact
+    (email+phone) and startTime (see run_push's grouping) as ONE combined
+    SCS reservation instead of one-per-Bookeo-booking. Confirmed live
+    2026-08-24: SCS refuses a second reservation for the same contact
+    within 3 hours, which a party split across multiple Bookeo
+    transactions (e.g. one booking per lane, or duplicate Bookeo customer
+    records for the same real person) otherwise hits. Combines party
+    sizes into one merged transform and lets find_reservation_code()'s
+    existing number_of_assets retry handle the resulting larger party --
+    same mechanism already proven for single large-party bookings.
+
+    Returns None (no-op) if every constituent booking is already migrated
+    under the SAME confirmation number (already merged by a prior run).
+    Raises MergeConflict, without writing anything, if the group is only
+    partially migrated or migrated under different confirmation numbers.
+    """
+    booking_numbers = [t["bookeo_booking_number"] for t in transformed_list]
+    entries = {bn: id_map.get(bn) for bn in booking_numbers}
+    migrated = {bn: e for bn, e in entries.items() if e is not None and e.get("status") != "cancelled"}
+
+    if len(migrated) == len(booking_numbers):
+        confirmation_numbers = {e["confirmation_number"] for e in migrated.values()}
+        if len(confirmation_numbers) == 1:
+            return None  # already merged by a prior run
+        raise MergeConflict(
+            f"{booking_numbers} are each already migrated but under different "
+            f"confirmation numbers {confirmation_numbers} -- needs a manual "
+            f"decision to cancel and re-merge, not automatic."
+        )
+    if migrated:
+        raise MergeConflict(
+            f"{list(migrated)} of {booking_numbers} already migrated "
+            f"(confirmation numbers {[e['confirmation_number'] for e in migrated.values()]}) "
+            f"but not all -- needs a manual decision to cancel and re-merge, not automatic."
+        )
+
+    merged = dict(transformed_list[0])
+    merged["bookeo_booking_number"] = "+".join(booking_numbers)
+    merged["party_size"] = sum(t["party_size"] for t in transformed_list)
+    merge_note = "Merged Bookeo bookings: " + ", ".join(booking_numbers)
+    comments_parts = [t["comments"] for t in transformed_list if t.get("comments")]
+    merged["comments"] = "\n\n".join([merge_note] + comments_parts)
+
+    reservation_code = find_reservation_code(reservations_api, merged)
+
+    extra = {}
+    if merged.get("comments"):
+        extra["comments"] = merged["comments"]
+
+    booked = reservations_api.book_reservation(
+        reservation_code=reservation_code,
+        first_name=merged["first_name"],
+        last_name=merged["last_name"],
+        email=merged["email"],
+        mobile_phone=merged["mobile_phone"],
+        temporary_hold=True,
+        **extra,
+    )
+
+    try:
+        for t in transformed_list:
+            id_map.record(
+                t["bookeo_booking_number"],
+                confirmation_number=booked["confirmationNumber"],
+                unique_id=booked.get("uniqueId"),
+                site_unique_id=booked.get("siteUniqueId"),
+                status="temporary_hold",
+                bookeo_customer_id=t.get("bookeo_customer_id"),
+                merged_with=[bn for bn in booking_numbers if bn != t["bookeo_booking_number"]],
+            )
+    except Exception:
+        reservations_api.cancel_reservation(
+            booked["confirmationNumber"], cancellation_reason="Other"
+        )
+        raise
+
+    return booked
+
+
 def convert_to_permanent(reservations_api, id_map, booking_number):
     """
     Convert one Bookeo booking's live SCS Temporary Hold into a real,
@@ -208,12 +303,75 @@ def run_push(start_time, end_time, limit=5, cleanup_after=False):
 
     bookings = bookeo.get_bookings(start_time=start_time, end_time=end_time)["data"][:limit]
 
+    # Bookings sharing an exact startTime with >=1 other booking in this
+    # batch are candidates for the same-contact-same-time merge case (see
+    # push_merged_booking) -- grouping by raw Bookeo customerId isn't
+    # enough since Bookeo is known to create duplicate customer records for
+    # the same real person, so the actual contact (email+phone) has to be
+    # resolved first. Everything else (the common case, a unique startTime)
+    # stays on the original cheap one-booking-to-one-reservation path below.
+    by_time = defaultdict(list)
+    for b in bookings:
+        by_time[b["startTime"]].append(b)
+
+    handled = set()
     pushed_this_run = []
+
+    for start, group_bookings in by_time.items():
+        if len(group_bookings) < 2:
+            continue
+
+        by_contact = defaultdict(list)
+        for b in group_bookings:
+            booking_number = b["bookingNumber"]
+            if b.get("canceled"):
+                print(f"skip {booking_number}: canceled in Bookeo")
+                handled.add(booking_number)
+                continue
+            customer = bookeo.get_customer(b["customerId"])
+            try:
+                transformed = transform_booking(b, customer, available_requests)
+            except ValueError as exc:
+                print(f"FAILED {booking_number}: {exc}")
+                handled.add(booking_number)
+                continue
+            by_contact[(transformed["email"].lower(), transformed["mobile_phone"])].append(transformed)
+
+        for contact, transformed_list in by_contact.items():
+            if len(transformed_list) < 2:
+                continue  # coincidental same startTime, different guest -- not a collision
+
+            booking_numbers = [t["bookeo_booking_number"] for t in transformed_list]
+            handled.update(booking_numbers)
+            try:
+                booked = push_merged_booking(reservations, id_map, transformed_list)
+            except MergeConflict as exc:
+                print(f"CONFLICT {booking_numbers}: {exc}")
+                continue
+            except (PushError, ValueError, SCSGatewayError) as exc:
+                print(f"FAILED {booking_numbers}: {exc}")
+                continue
+
+            if booked is None:
+                existing = id_map.get(booking_numbers[0])
+                print(f"skip {booking_numbers}: already migrated (merged) -> {existing['confirmation_number']}")
+                continue
+
+            print(f"pushed {booking_numbers} -> {booked['confirmationNumber']} (temporary hold, merged)")
+            pushed_this_run.extend(booking_numbers)
+
     for booking in bookings:
         booking_number = booking["bookingNumber"]
+        if booking_number in handled:
+            continue
+
         if id_map.is_migrated(booking_number):
             existing = id_map.get(booking_number)
             print(f"skip {booking_number}: already migrated -> {existing['confirmation_number']}")
+            continue
+
+        if booking.get("canceled"):
+            print(f"skip {booking_number}: canceled in Bookeo")
             continue
 
         customer = bookeo.get_customer(booking["customerId"])
