@@ -132,6 +132,39 @@ def push_booking(reservations_api, id_map, transformed):
     return booked
 
 
+def convert_to_permanent(reservations_api, id_map, booking_number):
+    """
+    Convert one Bookeo booking's live SCS Temporary Hold into a real,
+    permanent reservation (visible to SCS staff) via the already-tested
+    release_temporary_hold() (ReservationUpdate with temporaryHold=false).
+    No-op (returns None) if this booking has no temporary_hold entry in
+    id_map -- e.g. already converted, or never pushed.
+    """
+    entry = id_map.get(booking_number)
+    if entry is None or entry.get("status") != "temporary_hold":
+        return None
+
+    reservations_api.release_temporary_hold(entry["confirmation_number"])
+    id_map.update_status(booking_number, "booked")
+    return entry["confirmation_number"]
+
+
+def commit_all_holds(reservations_api, id_map):
+    """
+    Convert every temporary_hold entry currently in id_map into a real,
+    permanent SCS reservation. Mirrors cleanup_all_holds() but converts
+    instead of cancelling. Returns the list of Bookeo booking numbers that
+    were converted.
+    """
+    committed = []
+    for booking_number, entry in id_map.all().items():
+        if entry.get("status") != "temporary_hold":
+            continue
+        convert_to_permanent(reservations_api, id_map, booking_number)
+        committed.append(booking_number)
+    return committed
+
+
 def cleanup_all_holds(reservations_api, id_map):
     """
     Cancel every temporary_hold entry currently in id_map -- the sweep
@@ -163,7 +196,7 @@ def run_push(start_time, end_time, limit=5, cleanup_after=False):
     run just created before exiting.
     """
     from bookeo_api import BookeoAPI
-    from scs_gateway import SCSGatewayClient
+    from scs_gateway import SCSGatewayClient, SCSGatewayError
     from reservations import ReservationsAPI
 
     bookeo = BookeoAPI()
@@ -187,7 +220,7 @@ def run_push(start_time, end_time, limit=5, cleanup_after=False):
         try:
             transformed = transform_booking(booking, customer, available_requests)
             booked = push_booking(reservations, id_map, transformed)
-        except (PushError, ValueError) as exc:
+        except (PushError, ValueError, SCSGatewayError) as exc:
             print(f"FAILED {booking_number}: {exc}")
             continue
 
@@ -218,6 +251,24 @@ def run_cleanup():
         print(f"cancelled hold for {booking_number}")
 
 
+def run_commit():
+    """CLI entry for `python push.py commit` -- convert every
+    temporary_hold currently in id_map into a real, permanent SCS
+    reservation. This is the step that makes bookings visible to staff;
+    run only after spot-checking the holds created by `push`."""
+    from scs_gateway import SCSGatewayClient
+    from reservations import ReservationsAPI
+
+    reservations = ReservationsAPI(SCSGatewayClient())
+    id_map = IdMap()
+    committed = commit_all_holds(reservations, id_map)
+    if not committed:
+        print("nothing to commit.")
+    for booking_number in committed:
+        entry = id_map.get(booking_number)
+        print(f"committed {booking_number} -> {entry['confirmation_number']} (permanent)")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -231,9 +282,12 @@ if __name__ == "__main__":
     push_cmd.add_argument("--cleanup-after", action="store_true", help="Cancel every hold this run creates before exiting")
 
     sub.add_parser("cleanup", help="Cancel every temporary_hold currently recorded in id_map")
+    sub.add_parser("commit", help="Convert every temporary_hold currently recorded in id_map into a real, permanent reservation")
 
     args = parser.parse_args()
     if args.command == "push":
         run_push(args.start_time, args.end_time, limit=args.limit, cleanup_after=args.cleanup_after)
     elif args.command == "cleanup":
         run_cleanup()
+    elif args.command == "commit":
+        run_commit()
