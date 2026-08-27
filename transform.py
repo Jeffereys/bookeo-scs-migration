@@ -48,6 +48,31 @@ DEFAULT_REQUEST = ["Bowling"]
 
 DEFAULT_CANCELLATION_REASON = "Other"
 
+# ---------------------------------------------------------------------
+# Events (see transform_booking_to_event) -- the company doesn't use the
+# Reservations calendar operationally, only the Events calendar, so
+# push_events.py pushes bookings here instead of as Reservations.
+# ---------------------------------------------------------------------
+EVENT_SITE_NAME = SITE_NAME
+
+# Placeholder: confirmed via a live GetEventLocationOptions pull on
+# 2026-08-26 that this account has a "Bowling Lanes" Location (up to 24
+# concurrent events) but NO Function Type scoped to it or to the "Bowling"
+# Activity Type -- every Function Type configured (Bar Service, Catering,
+# Group Package, Meeting, Miscellaneous, ...) has activityTypeUniqueId=null
+# and locationUniqueIds=[]. Until an SCS admin creates a "Bowling" Function
+# Type tied to the "Bowling Lanes" Location, pushed bookings will show up
+# under "Miscellaneous" rather than anything bowling-specific.
+EVENT_LOCATION = "Bowling Lanes"
+EVENT_FUNCTION_TYPE = "Miscellaneous"
+
+# "New" is the first state in both of this account's Event Lifecycle Models
+# (Short Lifecycle and Standard Lifecycle) -- confirmed via a live
+# GetEventLifecycleModels pull on 2026-08-26. Field reference is
+# function.event.lifecycleState.stateType (confirmed live against Settings >
+# Events > Manage Event and Function Gateway Put Requests).
+EVENT_STATUS = "New"
+
 # Preference order when picking the one mobilePhone SCS wants out of
 # Bookeo's typed phoneNumbers[] list.
 PHONE_TYPE_PRIORITY = ["mobile", "cell", "home", "work", "other"]
@@ -210,6 +235,74 @@ def transform_booking(booking, customer, available_requests=None):
         "email": customer.get("emailAddress", ""),
         "mobile_phone": phone,
         "comments": comments,
+    }
+
+
+# ---------------------------------------------------------------------
+# Full booking -> SCS Event field transform
+# ---------------------------------------------------------------------
+def transform_booking_to_event(booking, customer):
+    """
+    booking/customer: same shapes as transform_booking().
+
+    Returns {"bookeo_booking_number", "bookeo_customer_id", "fields"} where
+    `fields` is a dict of EventFunctionImport Field Reference -> value,
+    ready for events.EventsAPI.create_event(). Field names are this
+    account's actual configured names (see EVENT_* constants' comments and
+    events.py's module docstring for how/when they were confirmed) -- do
+    not reuse them for a different SCS account without re-checking Settings
+    > Events > Manage Event and Function Gateway Put Requests.
+
+    Unlike transform_booking() (Reservations), there's no `available_requests`-
+    style live validation here: EVENT_FUNCTION_TYPE is a hardcoded
+    placeholder ("Miscellaneous") since this account has no Function Type
+    scoped to Bowling yet. Owner/salesperson fields are omitted entirely --
+    per Infor's Events and Functions doc, an omitted owner/salesperson (with
+    no default configured for the site) is assigned to the Gateway Agent
+    making the request.
+    """
+    start_date, start_time = split_bookeo_datetime(booking["startTime"])
+    _, end_time = split_bookeo_datetime(booking["endTime"])
+    party_size = aggregate_party_size(booking.get("participants"))
+    breakdown = format_party_breakdown(booking.get("participants"))
+    addons = format_addons_comment(booking.get("options"))
+
+    notes = "\n\n".join(
+        part for part in (f"Party: {breakdown}" if breakdown else "", addons) if part
+    )
+
+    first_name = customer.get("firstName", "")
+    last_name = customer.get("lastName", "")
+    if not last_name:
+        raise ValueError(f"Bookeo customer {customer.get('id')} has no last name")
+
+    phone = pick_mobile_phone(customer.get("phoneNumbers"))
+    if not phone:
+        raise ValueError(f"Bookeo customer {customer.get('id')} has no phone number")
+
+    fields = {
+        "function.event.site": EVENT_SITE_NAME,
+        "function.event.name": f"{first_name} {last_name}".strip(),
+        "function.event.lifecycleState.stateType": EVENT_STATUS,
+        "function.event.estimatedAttendance": str(party_size),
+        "function.event.contact.firstName": first_name,
+        "function.event.contact.lastName": last_name,
+        "function.event.contact.email": customer.get("emailAddress", ""),
+        "function.event.contact.mobilePhone": phone,
+        "function.startDate": start_date,
+        "function.startTime": start_time,
+        "function.endTime": end_time,
+        "function.functionType": EVENT_FUNCTION_TYPE,
+        "function.locations": EVENT_LOCATION,
+        "function.estimatedAttendance": str(party_size),
+    }
+    if notes:
+        fields["function.event.notes"] = notes
+
+    return {
+        "bookeo_booking_number": booking["bookingNumber"],
+        "bookeo_customer_id": customer.get("id"),
+        "fields": fields,
     }
 
 
