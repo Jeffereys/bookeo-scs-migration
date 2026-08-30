@@ -1,4 +1,7 @@
-id_map.json
-event_id_map.json
+# id_map.json / event_id_map.json are deliberately NOT ignored -- they are
+# the Bookeo<->SCS correlation tables and the ONLY thing that makes the push
+# scripts idempotent (there is no Events read endpoint to rebuild them from).
+# They hold opaque IDs + status + timestamps only, no names/emails/phones.
+.id_map_*.tmp
 __pycache__/
 *.pyc
