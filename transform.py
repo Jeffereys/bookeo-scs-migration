@@ -66,12 +66,21 @@ EVENT_SITE_NAME = SITE_NAME
 EVENT_LOCATION = "Bowling Lanes"
 EVENT_FUNCTION_TYPE = "Miscellaneous"
 
-# "New" is the first state in both of this account's Event Lifecycle Models
-# (Short Lifecycle and Standard Lifecycle) -- confirmed via a live
-# GetEventLifecycleModels pull on 2026-08-26. Field reference is
+# Event Status for pushed bookings. Field reference is
 # function.event.lifecycleState.stateType (confirmed live against Settings >
 # Events > Manage Event and Function Gateway Put Requests).
-EVENT_STATUS = "New"
+#
+# Was "New" (the model's first state) through 2026-08-31. Changed to
+# "OPTION_HOLD_5" so migrated bookings are visually distinct on the Events
+# calendar from staff-created "New" events: "New" renders #3D85C6 (blue),
+# "Option Hold 5" is colored #DACCEC (lavender) for the Burleson site under
+# Settings > Event Calendar Look and Feel. "Option Hold 5" (stateType
+# OPTION_HOLD_5, stateName "Option Hold 5", Prospect phase, 0% probability)
+# was added to the Burleson Standard Lifecycle model by an SCS admin on
+# 2026-08-31 -- before that, the gateway returned HTTP 500 for it. Gateway
+# events use the Standard Lifecycle model (Short Lifecycle has no such
+# state, so don't switch models without re-adding it there).
+EVENT_STATUS = "OPTION_HOLD_5"
 
 # Preference order when picking the one mobilePhone SCS wants out of
 # Bookeo's typed phoneNumbers[] list.
