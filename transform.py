@@ -289,10 +289,16 @@ def transform_booking_to_event(booking, customer):
     Unlike transform_booking() (Reservations), there's no `available_requests`-
     style live validation here: EVENT_FUNCTION_TYPE is a hardcoded
     placeholder ("Miscellaneous") since this account has no Function Type
-    scoped to Bowling yet. Owner/salesperson fields are omitted entirely --
-    per Infor's Events and Functions doc, an omitted owner/salesperson (with
-    no default configured for the site) is assigned to the Gateway Agent
-    making the request.
+    scoped to Bowling yet. Owner/salesperson fields are omitted deliberately
+    -- per Infor's Events and Functions doc an omitted owner/salesperson
+    (no site default) is assigned to the Gateway Agent making the request,
+    i.e. the `api_key` agent. That agent's Ownership Group was moved
+    Level 1 -> Level 3A on 2026-09-01 so ordinary event staff can edit these
+    Events (SCS computes edit access from the owner's live hierarchy
+    position, so it applied to all existing Events too). Do NOT re-raise the
+    agent's Ownership Group, and don't add owner.* fields here without a
+    reason -- gateway EventFunctionImport only takes owner as
+    emailAddress/firstName/lastName and needs a real SCS user.
 
     function.event.interfaceAccountId carries "BKO:<bookingNumber>" (see
     bookeo_marker) -- the migration's idempotency marker, read back via
