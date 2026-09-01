@@ -86,6 +86,30 @@ EVENT_STATUS = "OPTION_HOLD_5"
 # Bookeo's typed phoneNumbers[] list.
 PHONE_TYPE_PRIORITY = ["mobile", "cell", "home", "work", "other"]
 
+# The Bookeo booking number is stamped onto every migrated Event in
+# function.event.interfaceAccountId, prefixed with this, so the migration can
+# ask SCS "did I already import this booking?" instead of trusting a local
+# file. interfaceAccountId was verified unused on this account (null on all
+# ~12k events, 2026-08-31) and its value round-trips through the
+# BookeoMigration_Lookup Event Gateway Get Request. That Get Request can't
+# filter on interfaceAccountId server-side, so the read-back sweeps a
+# startDate window and matches this prefix locally -- see
+# migration/event_lookup.py.
+BOOKEO_MARKER_PREFIX = "BKO:"
+
+
+def bookeo_marker(bookeo_booking_number):
+    """The function.event.interfaceAccountId value for a Bookeo booking."""
+    return f"{BOOKEO_MARKER_PREFIX}{bookeo_booking_number}"
+
+
+def parse_bookeo_marker(interface_account_id):
+    """Inverse of bookeo_marker(): the Bookeo booking number out of an
+    interfaceAccountId value, or None if it isn't one of ours."""
+    if interface_account_id and interface_account_id.startswith(BOOKEO_MARKER_PREFIX):
+        return interface_account_id[len(BOOKEO_MARKER_PREFIX):]
+    return None
+
 
 # ---------------------------------------------------------------------
 # Date / time
@@ -269,6 +293,10 @@ def transform_booking_to_event(booking, customer):
     per Infor's Events and Functions doc, an omitted owner/salesperson (with
     no default configured for the site) is assigned to the Gateway Agent
     making the request.
+
+    function.event.interfaceAccountId carries "BKO:<bookingNumber>" (see
+    bookeo_marker) -- the migration's idempotency marker, read back via
+    migration/event_lookup.py.
     """
     start_date, start_time = split_bookeo_datetime(booking["startTime"])
     _, end_time = split_bookeo_datetime(booking["endTime"])
@@ -290,6 +318,7 @@ def transform_booking_to_event(booking, customer):
         raise ValueError(f"Bookeo customer {customer.get('id')} has no phone number")
 
     fields = {
+        "function.event.interfaceAccountId": bookeo_marker(booking["bookingNumber"]),
         "function.event.site": EVENT_SITE_NAME,
         "function.event.name": f"{first_name} {last_name}".strip(),
         "function.event.lifecycleState.stateType": EVENT_STATUS,
