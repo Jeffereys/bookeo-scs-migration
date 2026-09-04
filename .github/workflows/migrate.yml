@@ -53,24 +53,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout migration/
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout bookeo/
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Jeffereys/bookeo
           path: bookeo
           token: ${{ secrets.REPO_PAT }}
 
       - name: Checkout Reserve/
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Jeffereys/SCS
           path: Reserve
           token: ${{ secrets.REPO_PAT }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
