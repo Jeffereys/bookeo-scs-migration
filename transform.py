@@ -66,21 +66,34 @@ EVENT_SITE_NAME = SITE_NAME
 EVENT_LOCATION = "Bowling Lanes"
 EVENT_FUNCTION_TYPE = "Miscellaneous"
 
-# Event Status for pushed bookings. Field reference is
-# function.event.lifecycleState.stateType (confirmed live against Settings >
-# Events > Manage Event and Function Gateway Put Requests).
+# Event Status for pushed bookings (function.event.lifecycleState.stateType).
+# Accepted values are listed in the Details column on Settings > Events >
+# Manage Event and Function Gateway Put Requests: New, Inquiry, Proposal,
+# Option Hold 1-20, Tentative, Definite, Event Order, Guaranteed, Actualized,
+# Thank You, Closed, Cancelled. Run push in the default mode="test" after any
+# change here -- a value in the wrong form comes back as a Failed row, not a
+# bad write.
 #
-# Was "New" (the model's first state) through 2026-08-31. Changed to
-# "OPTION_HOLD_5" so migrated bookings are visually distinct on the Events
-# calendar from staff-created "New" events: "New" renders #3D85C6 (blue),
-# "Option Hold 5" is colored #DACCEC (lavender) for the Burleson site under
-# Settings > Event Calendar Look and Feel. "Option Hold 5" (stateType
-# OPTION_HOLD_5, stateName "Option Hold 5", Prospect phase, 0% probability)
-# was added to the Burleson Standard Lifecycle model by an SCS admin on
-# 2026-08-31 -- before that, the gateway returned HTTP 500 for it. Gateway
-# events use the Standard Lifecycle model (Short Lifecycle has no such
-# state, so don't switch models without re-adding it there).
-EVENT_STATUS = "OPTION_HOLD_5"
+# History:
+#   - "New" (the model's first state) through 2026-08-31.
+#   - "OPTION_HOLD_5" 2026-08-31..2026-09-09: a Prospect-phase, 0%-probability
+#     state an SCS admin added to the Burleson Standard Lifecycle model,
+#     used purely to give migrated events a distinct calendar color (#DACCEC
+#     lavender). Side effect -- closing an event out of a Prospect phase is
+#     treated as "lost business", which forced staff to clear a
+#     send-correspondence prompt on every close.
+#   - "Definite" from 2026-09-09: migrated Bookeo bookings are confirmed, paid
+#     bookings, so they are modeled as such. The calendar-color distinction
+#     moved to a dedicated Event Type (EVENT_TYPE below).
+EVENT_STATUS = "Definite"
+
+# Event Type for pushed bookings (function.event.eventType). A dedicated type
+# ("Bookeo Import") created under Settings > Events > Event Types and given
+# the lavender calendar color that used to come from the Option Hold 5
+# status. Also the clean hook for staff and reports to tell migrated bookings
+# apart from hand-entered events. Must exist in SCS before a push -- an
+# unknown type comes back as a Failed row.
+EVENT_TYPE = "Bookeo Import"
 
 # Preference order when picking the one mobilePhone SCS wants out of
 # Bookeo's typed phoneNumbers[] list.
@@ -328,6 +341,7 @@ def transform_booking_to_event(booking, customer):
         "function.event.site": EVENT_SITE_NAME,
         "function.event.name": f"{first_name} {last_name}".strip(),
         "function.event.lifecycleState.stateType": EVENT_STATUS,
+        "function.event.eventType": EVENT_TYPE,
         "function.event.estimatedAttendance": str(party_size),
         "function.event.contact.firstName": first_name,
         "function.event.contact.lastName": last_name,

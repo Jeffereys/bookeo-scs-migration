@@ -205,6 +205,53 @@ def backfill_interface_markers(mode="test"):
     print(f"\n{'(test) ' if mode == 'test' else ''}{ok} ok, {failed} failed")
 
 
+def backfill_event_type_and_status(mode="test"):
+    """
+    One-time: bring already-migrated Events onto the current EVENT_TYPE /
+    EVENT_STATUS (see transform.py). Events pushed 2026-08-27..2026-09-09
+    were created as status "Option Hold 5" with no Event Type; this sets
+    event.eventType = EVENT_TYPE and event.lifecycleState.stateType =
+    EVENT_STATUS on every entry in event_id_map.json, keyed on the cached
+    Event uniqueId. Idempotent: EventUpdate returns "Merged" and re-running
+    is harmless. mode="test" validates only; pass mode="apply" once test is
+    clean (and once the "Bookeo Import" Event Type exists in SCS).
+    """
+    from scs_gateway import SCSGatewayClient, SCSGatewayError
+    from events import EventsAPI
+    from transform import EVENT_TYPE, EVENT_STATUS
+
+    events_api = EventsAPI(SCSGatewayClient())
+    id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
+
+    ok = failed = 0
+    for booking_number, entry in sorted(id_map.all().items()):
+        event_uid = entry.get("site_unique_id")
+        if not event_uid:
+            print(f"skip {booking_number}: no Event uniqueId in cache")
+            failed += 1
+            continue
+        try:
+            r = events_api.update_event(
+                event_uid,
+                {
+                    "event.eventType": EVENT_TYPE,
+                    "event.lifecycleState.stateType": EVENT_STATUS,
+                },
+                mode=mode,
+            )["results"][0]
+        except (SCSGatewayError, KeyError, IndexError) as exc:
+            print(f"FAILED {booking_number} ({event_uid}): {exc}")
+            failed += 1
+            continue
+        if r.get("status") == "Failed":
+            print(f"FAILED {booking_number}: {r.get('messages')}")
+            failed += 1
+            continue
+        print(f"{booking_number} -> {r.get('status')}")
+        ok += 1
+    print(f"\n{'(test) ' if mode == 'test' else ''}{ok} ok, {failed} failed")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -235,6 +282,12 @@ if __name__ == "__main__":
     )
     backfill_cmd.add_argument("--apply", action="store_true", help="Actually write (default is test)")
 
+    backfill_ts_cmd = sub.add_parser(
+        "backfill-type-status",
+        help="One-time: set Event Type + status (EVENT_TYPE/EVENT_STATUS) on already-migrated Events",
+    )
+    backfill_ts_cmd.add_argument("--apply", action="store_true", help="Actually write (default is test)")
+
     args = parser.parse_args()
     if args.command == "push":
         run_push_events(args.start_time, args.end_time, limit=args.limit, mode="apply" if args.apply else "test")
@@ -242,3 +295,5 @@ if __name__ == "__main__":
         rebuild_event_id_map(args.start, args.end)
     elif args.command == "backfill-markers":
         backfill_interface_markers(mode="apply" if args.apply else "test")
+    elif args.command == "backfill-type-status":
+        backfill_event_type_and_status(mode="apply" if args.apply else "test")
