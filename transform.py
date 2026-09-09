@@ -195,6 +195,42 @@ def dedupe_customers(customers):
     ]
 
 
+# Bookeo customer.streetAddress sub-key -> SCS
+# function.event.contact.mailingAddress.* field reference (from Settings >
+# Events > Manage Event and Function Gateway Put Requests, Contact group).
+# SCS uses the mailing address for *printed* correspondence -- without it,
+# closing an Event that has a correspondence task can't produce the letter.
+# Bookeo's streetAddress is {address1, address2, city, state, postcode,
+# countryCode}, any subset, and is often absent entirely for phone / walk-in
+# bookings. If a real Bookeo customer with an address still comes through
+# with an empty SCS address, check these Bookeo key names against a live
+# get_customer() response -- a wrong key here fails silently (no address),
+# not loudly.
+_CONTACT_ADDRESS_MAP = {
+    "address1": "function.event.contact.mailingAddress.address1",
+    "address2": "function.event.contact.mailingAddress.address2",
+    "city": "function.event.contact.mailingAddress.city",
+    "state": "function.event.contact.mailingAddress.state",
+    "postcode": "function.event.contact.mailingAddress.zipCode",
+    "countryCode": "function.event.contact.mailingAddress.country",
+}
+
+
+def contact_address_fields(customer):
+    """
+    SCS function.event.contact.mailingAddress.* fields from a Bookeo
+    customer's streetAddress. Returns only the parts actually present -- an
+    empty dict if the customer has no address. Never raises; a missing
+    address is normal and just means no mailing address on the SCS contact.
+    """
+    address = customer.get("streetAddress") or {}
+    return {
+        scs_field: str(address[bookeo_key]).strip()
+        for bookeo_key, scs_field in _CONTACT_ADDRESS_MAP.items()
+        if str(address.get(bookeo_key) or "").strip()
+    }
+
+
 # ---------------------------------------------------------------------
 # Add-ons / notes
 # ---------------------------------------------------------------------
@@ -355,6 +391,7 @@ def transform_booking_to_event(booking, customer):
         "function.locations": EVENT_LOCATION,
         "function.estimatedAttendance": str(party_size),
     }
+    fields.update(contact_address_fields(customer))
     if notes:
         fields["function.event.notes"] = notes
 
