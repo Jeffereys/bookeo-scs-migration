@@ -67,12 +67,13 @@ EVENT_LOCATION = "Bowling Lanes"
 EVENT_FUNCTION_TYPE = "Miscellaneous"
 
 # Event Status for pushed bookings (function.event.lifecycleState.stateType).
-# Accepted values are listed in the Details column on Settings > Events >
-# Manage Event and Function Gateway Put Requests: New, Inquiry, Proposal,
-# Option Hold 1-20, Tentative, Definite, Event Order, Guaranteed, Actualized,
-# Thank You, Closed, Cancelled. Run push in the default mode="test" after any
-# change here -- a value in the wrong form comes back as a Failed row, not a
-# bad write.
+# This is the state's *stateType* (the UPPER_SNAKE enum name from
+# GetEventLifecycleModels), NOT the display name -- the gateway rejects
+# "Definite" but accepts "DEFINITE", same as "OPTION_HOLD_5" before it. The
+# state must also exist in the lifecycle model the gateway's events use (the
+# Burleson Standard Lifecycle model). Run push in the default mode="test"
+# after any change here -- a bad value comes back as a Failed row, not a bad
+# write.
 #
 # History:
 #   - "New" (the model's first state) through 2026-08-31.
@@ -82,10 +83,10 @@ EVENT_FUNCTION_TYPE = "Miscellaneous"
 #     lavender). Side effect -- closing an event out of a Prospect phase is
 #     treated as "lost business", which forced staff to clear a
 #     send-correspondence prompt on every close.
-#   - "Definite" from 2026-09-09: migrated Bookeo bookings are confirmed, paid
+#   - "DEFINITE" from 2026-09-09: migrated Bookeo bookings are confirmed, paid
 #     bookings, so they are modeled as such. The calendar-color distinction
 #     moved to a dedicated Event Type (EVENT_TYPE below).
-EVENT_STATUS = "Definite"
+EVENT_STATUS = "DEFINITE"
 
 # Event Type for pushed bookings (function.event.eventType). A dedicated type
 # ("Bookeo Import") created under Settings > Events > Event Types and given

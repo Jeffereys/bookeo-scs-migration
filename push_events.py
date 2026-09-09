@@ -205,6 +205,14 @@ def backfill_interface_markers(mode="test"):
     print(f"\n{'(test) ' if mode == 'test' else ''}{ok} ok, {failed} failed")
 
 
+def _status_already_processed(messages):
+    """True if an EventUpdate failed only because the Event is already at (or
+    past) the target lifecycle status -- SCS rejects re-processing a status
+    with "You cannot process a lifecycle status that was already processed
+    for this event." That's a no-op for us, not a real failure."""
+    return any("already processed" in (m or "").lower() for m in (messages or []))
+
+
 def backfill_event_type_and_status(mode="test"):
     """
     One-time: bring already-migrated Events onto the current EVENT_TYPE /
@@ -212,9 +220,15 @@ def backfill_event_type_and_status(mode="test"):
     were created as status "Option Hold 5" with no Event Type; this sets
     event.eventType = EVENT_TYPE and event.lifecycleState.stateType =
     EVENT_STATUS on every entry in event_id_map.json, keyed on the cached
-    Event uniqueId. Idempotent: EventUpdate returns "Merged" and re-running
-    is harmless. mode="test" validates only; pass mode="apply" once test is
-    clean (and once the "Bookeo Import" Event Type exists in SCS).
+    Event uniqueId.
+
+    Type and status go in two separate EventUpdate calls: an Event a staffer
+    has already advanced to (or past) EVENT_STATUS rejects the status change
+    ("already processed"), but should still get the event type -- keeping
+    them separate means one can't block the other. Idempotent (EventUpdate
+    returns "Merged" on a re-run). mode="test" validates only; pass
+    mode="apply" once test is clean and the "Bookeo Import" Event Type
+    exists in SCS.
     """
     from scs_gateway import SCSGatewayClient, SCSGatewayError
     from events import EventsAPI
@@ -223,6 +237,13 @@ def backfill_event_type_and_status(mode="test"):
     events_api = EventsAPI(SCSGatewayClient())
     id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
 
+    def _update(event_uid, fields):
+        try:
+            r = events_api.update_event(event_uid, fields, mode=mode)["results"][0]
+            return r.get("status"), r.get("messages")
+        except (SCSGatewayError, KeyError, IndexError) as exc:
+            return "Failed", [str(exc)]
+
     ok = failed = 0
     for booking_number, entry in sorted(id_map.all().items()):
         event_uid = entry.get("site_unique_id")
@@ -230,24 +251,23 @@ def backfill_event_type_and_status(mode="test"):
             print(f"skip {booking_number}: no Event uniqueId in cache")
             failed += 1
             continue
-        try:
-            r = events_api.update_event(
-                event_uid,
-                {
-                    "event.eventType": EVENT_TYPE,
-                    "event.lifecycleState.stateType": EVENT_STATUS,
-                },
-                mode=mode,
-            )["results"][0]
-        except (SCSGatewayError, KeyError, IndexError) as exc:
-            print(f"FAILED {booking_number} ({event_uid}): {exc}")
+
+        type_status, type_msgs = _update(event_uid, {"event.eventType": EVENT_TYPE})
+        if type_status == "Failed":
+            print(f"FAILED {booking_number} ({event_uid}) type: {type_msgs}")
             failed += 1
             continue
-        if r.get("status") == "Failed":
-            print(f"FAILED {booking_number}: {r.get('messages')}")
+
+        stat_status, stat_msgs = _update(
+            event_uid, {"event.lifecycleState.stateType": EVENT_STATUS}
+        )
+        if stat_status == "Failed" and not _status_already_processed(stat_msgs):
+            print(f"FAILED {booking_number} ({event_uid}) status: {stat_msgs}")
             failed += 1
             continue
-        print(f"{booking_number} -> {r.get('status')}")
+
+        note = "" if stat_status != "Failed" else " (status already set, type only)"
+        print(f"{booking_number} -> type {type_status}, status {stat_status}{note}")
         ok += 1
     print(f"\n{'(test) ' if mode == 'test' else ''}{ok} ok, {failed} failed")
 
