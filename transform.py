@@ -78,23 +78,45 @@ EVENT_FUNCTION_TYPE = "Miscellaneous"
 # History:
 #   - "New" (the model's first state) through 2026-08-31.
 #   - "OPTION_HOLD_5" 2026-08-31..2026-09-09: a Prospect-phase, 0%-probability
-#     state an SCS admin added to the Burleson Standard Lifecycle model,
-#     used purely to give migrated events a distinct calendar color (#DACCEC
-#     lavender). Side effect -- closing an event out of a Prospect phase is
-#     treated as "lost business", which forced staff to clear a
-#     send-correspondence prompt on every close.
-#   - "DEFINITE" from 2026-09-09: migrated Bookeo bookings are confirmed, paid
-#     bookings, so they are modeled as such. The calendar-color distinction
-#     moved to a dedicated Event Type (EVENT_TYPE below).
-EVENT_STATUS = "DEFINITE"
+#     state an SCS admin added to the Burleson Standard Lifecycle model, to
+#     give migrated events a distinct calendar color (#DACCEC lavender), since
+#     the Events calendar colors by lifecycle status, not by Event Type.
+#   - "DEFINITE" briefly on 2026-09-09: modeled the bookings as the confirmed
+#     bookings they are and stopped closes reading as "lost business" -- but
+#     Definite renders green on the calendar, same as staff-created events,
+#     losing the visual cue.
+#   - back to "OPTION_HOLD_5" from 2026-09-09 to keep the lavender cue. The
+#     lost-business-on-close prompt is being addressed another way (mailing
+#     address on the contact / Manage Task Defaults) rather than by moving
+#     off the colored status.
+EVENT_STATUS = "OPTION_HOLD_5"
 
 # Event Type for pushed bookings (function.event.eventType). A dedicated type
-# ("Bookeo Import") created under Settings > Events > Event Types and given
-# the lavender calendar color that used to come from the Option Hold 5
-# status. Also the clean hook for staff and reports to tell migrated bookings
-# apart from hand-entered events. Must exist in SCS before a push -- an
-# unknown type comes back as a Failed row.
+# ("Bookeo Import") created under Settings > Events > Event Types -- the clean
+# hook for staff and reports to filter migrated bookings apart from
+# hand-entered events (the calendar color itself comes from EVENT_STATUS, not
+# from the type). Must exist in SCS before a push -- an unknown type comes
+# back as a Failed row.
 EVENT_TYPE = "Bookeo Import"
+
+# Salesperson for pushed bookings. SCS correspondence (confirmations, close
+# notices, ...) sends *from* the event's salesperson. With owner/salesperson
+# omitted the gateway assigns its own agent, which has no real mailbox -- so
+# those emails can't go out and staff are forced to clear the
+# send-correspondence box on every close. "Online Bookings" is a dedicated
+# SCS user (Burleson) for exactly this. Salesperson only -- owner still
+# defaults to the gateway agent, whose Ownership Group (Level 3A) is what
+# gives staff edit access to these events.
+#
+# Matched by username, not email: the gateway rejects an email that resolves
+# to more than one User ("Multiple salespersons found."), and this user's
+# monitored inbox is shared with a real person. Field is
+# function.event.salesperson.username on the create path,
+# event.salesperson.username on the update path (both confirmed against
+# Manage Event ... Gateway Put Requests). A gateway default salesperson is
+# also set under Manage Event and Function Gateway Put Request Settings as a
+# backstop.
+EVENT_SALESPERSON_USERNAME = "bookings"
 
 # Preference order when picking the one mobilePhone SCS wants out of
 # Bookeo's typed phoneNumbers[] list.
@@ -379,6 +401,7 @@ def transform_booking_to_event(booking, customer):
         "function.event.name": f"{first_name} {last_name}".strip(),
         "function.event.lifecycleState.stateType": EVENT_STATUS,
         "function.event.eventType": EVENT_TYPE,
+        "function.event.salesperson.username": EVENT_SALESPERSON_USERNAME,
         "function.event.estimatedAttendance": str(party_size),
         "function.event.contact.firstName": first_name,
         "function.event.contact.lastName": last_name,

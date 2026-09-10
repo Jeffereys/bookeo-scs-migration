@@ -216,23 +216,25 @@ def _status_already_processed(messages):
 def backfill_event_type_and_status(mode="test"):
     """
     One-time: bring already-migrated Events onto the current EVENT_TYPE /
-    EVENT_STATUS (see transform.py). Events pushed 2026-08-27..2026-09-09
-    were created as status "Option Hold 5" with no Event Type; this sets
-    event.eventType = EVENT_TYPE and event.lifecycleState.stateType =
-    EVENT_STATUS on every entry in event_id_map.json, keyed on the cached
-    Event uniqueId.
+    EVENT_SALESPERSON_USERNAME / EVENT_STATUS (see transform.py). Events
+    pushed 2026-08-27..2026-09-09 were created as status "Option Hold 5",
+    with no Event Type and the gateway agent as salesperson; this sets
+    event.eventType, event.salesperson.username, and
+    event.lifecycleState.stateType on every entry in event_id_map.json,
+    keyed on the cached Event uniqueId.
 
-    Type and status go in two separate EventUpdate calls: an Event a staffer
-    has already advanced to (or past) EVENT_STATUS rejects the status change
-    ("already processed"), but should still get the event type -- keeping
-    them separate means one can't block the other. Idempotent (EventUpdate
+    Type + salesperson go in one EventUpdate call, status in a second: an
+    Event a staffer has already advanced to (or past) EVENT_STATUS rejects
+    the status change ("already processed", and it can't move backward
+    either), but should still get the type and salesperson -- keeping them
+    separate means one can't block the other. Idempotent (EventUpdate
     returns "Merged" on a re-run). mode="test" validates only; pass
-    mode="apply" once test is clean and the "Bookeo Import" Event Type
-    exists in SCS.
+    mode="apply" once test is clean and the "Bookeo Import" Event Type and
+    "Online Bookings" user both exist in SCS.
     """
     from scs_gateway import SCSGatewayClient, SCSGatewayError
     from events import EventsAPI
-    from transform import EVENT_TYPE, EVENT_STATUS
+    from transform import EVENT_TYPE, EVENT_STATUS, EVENT_SALESPERSON_USERNAME
 
     events_api = EventsAPI(SCSGatewayClient())
     id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
@@ -252,9 +254,12 @@ def backfill_event_type_and_status(mode="test"):
             failed += 1
             continue
 
-        type_status, type_msgs = _update(event_uid, {"event.eventType": EVENT_TYPE})
-        if type_status == "Failed":
-            print(f"FAILED {booking_number} ({event_uid}) type: {type_msgs}")
+        base_status, base_msgs = _update(event_uid, {
+            "event.eventType": EVENT_TYPE,
+            "event.salesperson.username": EVENT_SALESPERSON_USERNAME,
+        })
+        if base_status == "Failed":
+            print(f"FAILED {booking_number} ({event_uid}) type/salesperson: {base_msgs}")
             failed += 1
             continue
 
@@ -266,8 +271,8 @@ def backfill_event_type_and_status(mode="test"):
             failed += 1
             continue
 
-        note = "" if stat_status != "Failed" else " (status already set, type only)"
-        print(f"{booking_number} -> type {type_status}, status {stat_status}{note}")
+        note = "" if stat_status != "Failed" else " (status already set; type/salesperson only)"
+        print(f"{booking_number} -> type/salesperson {base_status}, status {stat_status}{note}")
         ok += 1
     print(f"\n{'(test) ' if mode == 'test' else ''}{ok} ok, {failed} failed")
 
@@ -304,7 +309,8 @@ if __name__ == "__main__":
 
     backfill_ts_cmd = sub.add_parser(
         "backfill-type-status",
-        help="One-time: set Event Type + status (EVENT_TYPE/EVENT_STATUS) on already-migrated Events",
+        help="One-time: set Event Type + salesperson + status on already-migrated Events "
+             "(EVENT_TYPE / EVENT_SALESPERSON_USERNAME / EVENT_STATUS)",
     )
     backfill_ts_cmd.add_argument("--apply", action="store_true", help="Actually write (default is test)")
 
