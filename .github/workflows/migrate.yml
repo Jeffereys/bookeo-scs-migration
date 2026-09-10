@@ -1,31 +1,32 @@
-# Scheduled Bookeo -> Reserve (SCS Events) migration.
+# Scheduled Bookeo -> Reserve (SCS Events) migration, one Bookeo account per
+# Alley Cats venue (see transform.VENUES).
 #
 # What it does each run:
 #   1. Checks out this repo plus the two client repos as siblings
 #      (bookeo/ <- Jeffereys/bookeo, Reserve/ <- Jeffereys/SCS).
-#   2. Sweeps Bookeo forward in 30-day windows (default 6 = ~180 days).
-#      run_push_events() first queries SCS for every booking already
-#      migrated in each window (the BookeoMigration_Lookup marker sweep) and
-#      skips those -- that is the real idempotency guard, so a re-run never
-#      duplicates an Event. event_id_map.json is only a fast-path cache.
+#   2. For each venue that has Bookeo credentials in the environment, sweeps
+#      Bookeo forward in 30-day windows (default 6 = ~180 days).
+#      run_push_events() first queries SCS for every booking already migrated
+#      in each window (the BookeoMigration_Lookup marker sweep, scoped by the
+#      venue's marker prefix) and skips those -- the real idempotency guard.
+#      A venue with no credentials prints "SKIP <venue>" and is a no-op.
 #   3. On a scheduled run (or a manual run with apply=true) it writes real
-#      staff-visible Events (status "Option Hold 5", lavender) and commits
-#      the updated event_id_map.json back to this repo.
+#      staff-visible Events (status "Option Hold 5", lavender) and commits the
+#      updated event_id_map.<venue>.json files back to this repo.
 #      Events have NO rollback -- see README / Project_details.txt.
-#   4. A manual run with apply=false (the default for workflow_dispatch) is
-#      a dry run: it validates every row and writes nothing.
+#   4. A manual run with apply=false (the default for workflow_dispatch) is a
+#      dry run: it validates every row and writes nothing.
 #
 # To make the SCHEDULE dry-run only, change the `--apply` decision in the
 # "Sweep" step (search for MODE_FLAG) to require `inputs.apply` as well.
 #
 # REQUIRED SECRETS (Settings > Secrets and variables > Actions):
-#   BOOKEO_API_KEY          Bookeo API key      (bookeo/.env BOOKEO_API_KEY)
-#   BOOKEO_SECRET_KEY       Bookeo secret key   (bookeo/.env BOOKEO_SECRET_KEY)
-#   SCS_GATEWAY_USERNAME    SCS gateway user    (Reserve/.env)
-#   SCS_GATEWAY_PASSWORD    SCS gateway pass    (Reserve/.env)
-#   REPO_PAT                fine-grained PAT with READ on Jeffereys/bookeo
-#                           and Jeffereys/SCS (GITHUB_TOKEN can't reach them).
-#                           Drop the `token:` lines if both are public.
+#   BOOKEO_API_KEY / BOOKEO_SECRET_KEY                       Burleson Bookeo account
+#   BOOKEO_HURST_API_KEY / BOOKEO_HURST_SECRET_KEY           Hurst (add when launched)
+#   BOOKEO_ARLINGTON_API_KEY / BOOKEO_ARLINGTON_SECRET_KEY   Arlington (add when launched)
+#   SCS_GATEWAY_USERNAME / SCS_GATEWAY_PASSWORD              one gateway agent, cross-site
+#   REPO_PAT   fine-grained PAT with READ on Jeffereys/bookeo and Jeffereys/SCS
+#             (GITHUB_TOKEN can't reach them). Drop the `token:` lines if both are public.
 name: Migrate Bookeo bookings
 
 on:
@@ -81,6 +82,10 @@ jobs:
         env:
           BOOKEO_API_KEY: ${{ secrets.BOOKEO_API_KEY }}
           BOOKEO_SECRET_KEY: ${{ secrets.BOOKEO_SECRET_KEY }}
+          BOOKEO_HURST_API_KEY: ${{ secrets.BOOKEO_HURST_API_KEY }}
+          BOOKEO_HURST_SECRET_KEY: ${{ secrets.BOOKEO_HURST_SECRET_KEY }}
+          BOOKEO_ARLINGTON_API_KEY: ${{ secrets.BOOKEO_ARLINGTON_API_KEY }}
+          BOOKEO_ARLINGTON_SECRET_KEY: ${{ secrets.BOOKEO_ARLINGTON_SECRET_KEY }}
           SCS_GATEWAY_USERNAME: ${{ secrets.SCS_GATEWAY_USERNAME }}
           SCS_GATEWAY_PASSWORD: ${{ secrets.SCS_GATEWAY_PASSWORD }}
           PYTHONPATH: ${{ github.workspace }}/bookeo:${{ github.workspace }}/Reserve
@@ -97,29 +102,32 @@ jobs:
           echo "mode: ${MODE_FLAG:-test (dry run)}" | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          START="$(date -u +%Y-%m-%dT00:00:00Z)"
-          for _ in $(seq 1 "$WINDOWS"); do
-            END="$(date -u -d "$START +30 days" +%Y-%m-%dT00:00:00Z)"
-            echo "::group::window $START -> $END"
-            python3 push_events.py push "$START" "$END" --limit 100 $MODE_FLAG \
-              | tee -a "$GITHUB_STEP_SUMMARY"
+          for VENUE in burleson hurst arlington; do
+            echo "::group::venue $VENUE"
+            echo "### $VENUE" >> "$GITHUB_STEP_SUMMARY"
+            START="$(date -u +%Y-%m-%dT00:00:00Z)"
+            for _ in $(seq 1 "$WINDOWS"); do
+              END="$(date -u -d "$START +30 days" +%Y-%m-%dT00:00:00Z)"
+              python3 push_events.py push "$VENUE" "$START" "$END" --limit 100 $MODE_FLAG \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              START="$END"
+            done
             echo "::endgroup::"
-            START="$END"
           done
 
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Commit event_id_map.json if it changed
+      - name: Commit changed event_id_map files
         if: ${{ github.event_name == 'schedule' || inputs.apply == true }}
         run: |
           set -euo pipefail
-          if git diff --quiet -- event_id_map.json; then
+          if git diff --quiet -- 'event_id_map.*.json'; then
             echo "no map changes" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git config user.name  "migration-bot"
           git config user.email "migration-bot@users.noreply.github.com"
-          git add event_id_map.json
+          git add event_id_map.*.json
           git commit -m "Automated: migrate new Bookeo bookings ($(date -u +%F))"
           git push
-          echo "committed updated event_id_map.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "committed updated event_id_map files" | tee -a "$GITHUB_STEP_SUMMARY"

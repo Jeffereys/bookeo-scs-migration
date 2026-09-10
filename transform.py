@@ -34,9 +34,74 @@ Bookeo-id <-> SCS-confirmationNumber correlation table needed once bookings
 actually get pushed, and any SCS-side admin config work.
 """
 
+from dataclasses import dataclass
 from datetime import datetime
 
-SITE_NAME = "Alley Cats Entertainment, Burleson"
+
+# ---------------------------------------------------------------------
+# Venues
+# ---------------------------------------------------------------------
+# One Bookeo account per Alley Cats venue (confirmed: the Burleson account's
+# /settings/business is "Alley Cats Burleson", one resource, no venue field on
+# bookings). Each venue is pulled from its own Bookeo credentials and pushed
+# to its own SCS site. Everything else -- the "Bookeo Import" Event Type, the
+# "Online Bookings" salesperson, the OPTION_HOLD_5 status, "Miscellaneous"
+# function type -- is shared (all Master List / cross-site in SCS, verified
+# via a live GetEventLocationOptions pull on all three sites).
+@dataclass(frozen=True)
+class Venue:
+    key: str                       # CLI argument / dict key
+    scs_site_name: str             # function.event.site
+    event_location: str            # function.locations
+    bookeo_env_prefix: str         # {prefix}_API_KEY / {prefix}_SECRET_KEY in the environment
+    marker_prefix: str             # function.event.interfaceAccountId prefix -- MUST be venue-unique
+    id_map_filename: str           # per-venue idempotency cache (committed, next to this file)
+    salesperson_username: str = "bookings"  # shared "Online Bookings" SCS user for now
+
+
+VENUES = {
+    "burleson": Venue(
+        key="burleson",
+        scs_site_name="Alley Cats Entertainment, Burleson",
+        event_location="Bowling Lanes",
+        bookeo_env_prefix="BOOKEO",              # existing BOOKEO_API_KEY / BOOKEO_SECRET_KEY
+        marker_prefix="BKO:",                    # unchanged -- the ~78+ live Events carry this
+        id_map_filename="event_id_map.burleson.json",
+    ),
+    "hurst": Venue(
+        key="hurst",
+        scs_site_name="Alley Cats Entertainment, Hurst",
+        # Hurst has no "Bowling Lanes" Location -- options are Lower Lanes /
+        # Upper Lanes / Party Room / Conference Room / Other. Function type
+        # stays "Miscellaneous" (no asset binding), so this is only a label.
+        # TODO: confirm the right one with Alley Cats before enabling Hurst.
+        event_location="Lower Lanes",
+        bookeo_env_prefix="BOOKEO_HURST",
+        marker_prefix="BKO:ACEH:",
+        id_map_filename="event_id_map.hurst.json",
+    ),
+    "arlington": Venue(
+        key="arlington",
+        scs_site_name="Alley Cats Entertainment, Arlington",
+        event_location="Bowling Lanes",
+        bookeo_env_prefix="BOOKEO_ARLINGTON",
+        marker_prefix="BKO:ARL:",
+        id_map_filename="event_id_map.arlington.json",
+    ),
+}
+
+DEFAULT_VENUE = VENUES["burleson"]
+
+
+def get_venue(key):
+    """Look up a Venue by key, with a clear error for a bad CLI argument."""
+    try:
+        return VENUES[key]
+    except KeyError:
+        raise ValueError(f"unknown venue {key!r}; expected one of {sorted(VENUES)}")
+
+
+SITE_NAME = DEFAULT_VENUE.scs_site_name  # kept for push.py (Reservations, Burleson-only)
 
 # Bookeo productName (matched as a lowercase substring) -> SCS `requests`
 # values. Only "Bowling" is configured on the SCS side for this site as of
@@ -53,7 +118,7 @@ DEFAULT_CANCELLATION_REASON = "Other"
 # Reservations calendar operationally, only the Events calendar, so
 # push_events.py pushes bookings here instead of as Reservations.
 # ---------------------------------------------------------------------
-EVENT_SITE_NAME = SITE_NAME
+EVENT_SITE_NAME = SITE_NAME  # legacy alias; use venue.scs_site_name
 
 # Placeholder: confirmed via a live GetEventLocationOptions pull on
 # 2026-08-26 that this account has a "Bowling Lanes" Location (up to 24
@@ -63,8 +128,8 @@ EVENT_SITE_NAME = SITE_NAME
 # and locationUniqueIds=[]. Until an SCS admin creates a "Bowling" Function
 # Type tied to the "Bowling Lanes" Location, pushed bookings will show up
 # under "Miscellaneous" rather than anything bowling-specific.
-EVENT_LOCATION = "Bowling Lanes"
-EVENT_FUNCTION_TYPE = "Miscellaneous"
+EVENT_LOCATION = DEFAULT_VENUE.event_location  # legacy alias; use venue.event_location
+EVENT_FUNCTION_TYPE = "Miscellaneous"  # shared across venues
 
 # Event Status for pushed bookings (function.event.lifecycleState.stateType).
 # This is the state's *stateType* (the UPPER_SNAKE enum name from
@@ -123,28 +188,33 @@ EVENT_SALESPERSON_USERNAME = "bookings"
 PHONE_TYPE_PRIORITY = ["mobile", "cell", "home", "work", "other"]
 
 # The Bookeo booking number is stamped onto every migrated Event in
-# function.event.interfaceAccountId, prefixed with this, so the migration can
-# ask SCS "did I already import this booking?" instead of trusting a local
-# file. interfaceAccountId was verified unused on this account (null on all
-# ~12k events, 2026-08-31) and its value round-trips through the
+# function.event.interfaceAccountId, prefixed per venue (see Venue.marker_prefix),
+# so the migration can ask SCS "did I already import this booking?" instead of
+# trusting a local file. interfaceAccountId was verified unused on this account
+# (null on all ~12k events, 2026-08-31) and its value round-trips through the
 # BookeoMigration_Lookup Event Gateway Get Request. That Get Request can't
-# filter on interfaceAccountId server-side, so the read-back sweeps a
-# startDate window and matches this prefix locally -- see
-# migration/event_lookup.py.
-BOOKEO_MARKER_PREFIX = "BKO:"
+# filter on interfaceAccountId server-side, so the read-back sweeps a startDate
+# window and matches the venue prefix locally -- see migration/event_lookup.py.
+# Each venue has its own prefix because booking numbers from different Bookeo
+# accounts could collide: Burleson "BKO:123", Hurst "BKO:ACEH:123".
+BOOKEO_MARKER_PREFIX = DEFAULT_VENUE.marker_prefix  # legacy alias
 
 
-def bookeo_marker(bookeo_booking_number):
+def bookeo_marker(bookeo_booking_number, venue=DEFAULT_VENUE):
     """The function.event.interfaceAccountId value for a Bookeo booking."""
-    return f"{BOOKEO_MARKER_PREFIX}{bookeo_booking_number}"
+    return f"{venue.marker_prefix}{bookeo_booking_number}"
 
 
-def parse_bookeo_marker(interface_account_id):
+def parse_bookeo_marker(interface_account_id, venue=DEFAULT_VENUE):
     """Inverse of bookeo_marker(): the Bookeo booking number out of an
-    interfaceAccountId value, or None if it isn't one of ours."""
-    if interface_account_id and interface_account_id.startswith(BOOKEO_MARKER_PREFIX):
-        return interface_account_id[len(BOOKEO_MARKER_PREFIX):]
-    return None
+    interfaceAccountId value, or None if it isn't one of `venue`'s markers.
+    A booking number is all digits, so a longer-prefixed marker from another
+    venue (e.g. Hurst's "BKO:ACEH:123" read with Burleson's "BKO:" prefix)
+    leaves a non-numeric remainder and is correctly rejected."""
+    if not interface_account_id or not interface_account_id.startswith(venue.marker_prefix):
+        return None
+    rest = interface_account_id[len(venue.marker_prefix):]
+    return rest if rest.isdigit() else None
 
 
 # ---------------------------------------------------------------------
@@ -346,9 +416,12 @@ def transform_booking(booking, customer, available_requests=None):
 # ---------------------------------------------------------------------
 # Full booking -> SCS Event field transform
 # ---------------------------------------------------------------------
-def transform_booking_to_event(booking, customer):
+def transform_booking_to_event(booking, customer, venue=None):
     """
     booking/customer: same shapes as transform_booking().
+    venue: a Venue (see VENUES); defaults to Burleson. Sets
+        function.event.site, function.locations, the salesperson, and the
+        interfaceAccountId marker prefix.
 
     Returns {"bookeo_booking_number", "bookeo_customer_id", "fields"} where
     `fields` is a dict of EventFunctionImport Field Reference -> value,
@@ -372,10 +445,11 @@ def transform_booking_to_event(booking, customer):
     reason -- gateway EventFunctionImport only takes owner as
     emailAddress/firstName/lastName and needs a real SCS user.
 
-    function.event.interfaceAccountId carries "BKO:<bookingNumber>" (see
-    bookeo_marker) -- the migration's idempotency marker, read back via
+    function.event.interfaceAccountId carries the venue-prefixed marker (see
+    bookeo_marker) -- the migration's idempotency key, read back via
     migration/event_lookup.py.
     """
+    venue = venue or DEFAULT_VENUE
     start_date, start_time = split_bookeo_datetime(booking["startTime"])
     _, end_time = split_bookeo_datetime(booking["endTime"])
     party_size = aggregate_party_size(booking.get("participants"))
@@ -396,12 +470,12 @@ def transform_booking_to_event(booking, customer):
         raise ValueError(f"Bookeo customer {customer.get('id')} has no phone number")
 
     fields = {
-        "function.event.interfaceAccountId": bookeo_marker(booking["bookingNumber"]),
-        "function.event.site": EVENT_SITE_NAME,
+        "function.event.interfaceAccountId": bookeo_marker(booking["bookingNumber"], venue),
+        "function.event.site": venue.scs_site_name,
         "function.event.name": f"{first_name} {last_name}".strip(),
         "function.event.lifecycleState.stateType": EVENT_STATUS,
         "function.event.eventType": EVENT_TYPE,
-        "function.event.salesperson.username": EVENT_SALESPERSON_USERNAME,
+        "function.event.salesperson.username": venue.salesperson_username,
         "function.event.estimatedAttendance": str(party_size),
         "function.event.contact.firstName": first_name,
         "function.event.contact.lastName": last_name,
@@ -411,7 +485,7 @@ def transform_booking_to_event(booking, customer):
         "function.startTime": start_time,
         "function.endTime": end_time,
         "function.functionType": EVENT_FUNCTION_TYPE,
-        "function.locations": EVENT_LOCATION,
+        "function.locations": venue.event_location,
         "function.estimatedAttendance": str(party_size),
     }
     fields.update(contact_address_fields(customer))

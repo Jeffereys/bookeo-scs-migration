@@ -1,6 +1,7 @@
-# id_map.json / event_id_map.json are deliberately NOT ignored -- they are
-# the Bookeo<->SCS correlation tables and the ONLY thing that makes the push
-# scripts idempotent (there is no Events read endpoint to rebuild them from).
+# id_map.json / event_id_map.<venue>.json are deliberately NOT ignored -- they
+# are the Bookeo<->SCS correlation tables and the fast-path idempotency cache
+# (rebuildable from SCS via `push_events.py rebuild <venue> ...`). One file per
+# venue: event_id_map.burleson.json, event_id_map.hurst.json, ...
 # They hold opaque IDs + status + timestamps only, no names/emails/phones.
 .id_map_*.tmp
 __pycache__/

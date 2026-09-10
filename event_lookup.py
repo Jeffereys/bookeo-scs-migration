@@ -26,7 +26,7 @@ order:
 
 import datetime as _dt
 
-from transform import parse_bookeo_marker
+from transform import parse_bookeo_marker, DEFAULT_VENUE
 
 LOOKUP_REQUEST_NAME = "BookeoMigration_Lookup"
 _PAGE_SIZE = 100  # SCS hard cap on maxResults
@@ -71,13 +71,15 @@ def _widen(start_mmddyyyy, end_mmddyyyy, days=1):
 # ---------------------------------------------------------------------
 # Core sweep
 # ---------------------------------------------------------------------
-def iter_events(client, start, end, widen_days=1):
+def iter_events(client, start, end, venue=DEFAULT_VENUE, widen_days=1):
     """
     Yield each SCS Event (as a header-keyed dict) whose startDate is in
-    [start, end] AND whose interfaceAccountId is a Bookeo marker.
+    [start, end] AND whose interfaceAccountId is a Bookeo marker for `venue`.
 
     `client` is a Reserve.scs_gateway.SCSGatewayClient. `start`/`end` accept
-    anything to_mmddyyyy() understands.
+    anything to_mmddyyyy() understands. The Get Request isn't site-filtered,
+    so this can see Events from every venue -- the per-venue marker prefix
+    (parse_bookeo_marker) is what scopes the result.
     """
     start_s, end_s = _widen(to_mmddyyyy(start), to_mmddyyyy(end), days=widen_days)
     filters = [
@@ -98,7 +100,7 @@ def iter_events(client, start, end, widen_days=1):
         rows = resp.get("results") or []
         for row in rows:
             record = dict(zip(header, row))
-            if parse_bookeo_marker(record.get("interfaceAccountId")) is not None:
+            if parse_bookeo_marker(record.get("interfaceAccountId"), venue) is not None:
                 yield record
 
         seen += len(rows)
@@ -111,12 +113,12 @@ def iter_events(client, start, end, widen_days=1):
 # ---------------------------------------------------------------------
 # Convenience shapes
 # ---------------------------------------------------------------------
-def migrated_event_index(client, start, end, widen_days=1):
+def migrated_event_index(client, start, end, venue=DEFAULT_VENUE, widen_days=1):
     """{bookeo_booking_number: {event_unique_id, event_number, name,
-    start_date, start_time, status, locations}} for the window."""
+    start_date, start_time, status, locations}} for the window and venue."""
     index = {}
-    for rec in iter_events(client, start, end, widen_days=widen_days):
-        booking_number = parse_bookeo_marker(rec["interfaceAccountId"])
+    for rec in iter_events(client, start, end, venue=venue, widen_days=widen_days):
+        booking_number = parse_bookeo_marker(rec["interfaceAccountId"], venue)
         index[booking_number] = {
             "event_unique_id": rec.get("uniqueId"),
             "event_number": rec.get("eventNumber"),
@@ -129,19 +131,19 @@ def migrated_event_index(client, start, end, widen_days=1):
     return index
 
 
-def migrated_booking_numbers(client, start, end, widen_days=1):
+def migrated_booking_numbers(client, start, end, venue=DEFAULT_VENUE, widen_days=1):
     """Set of Bookeo booking numbers already present as Events in SCS for
-    the window -- the per-run idempotency guard."""
+    the window and venue -- the per-run idempotency guard."""
     return {
-        parse_bookeo_marker(rec["interfaceAccountId"])
-        for rec in iter_events(client, start, end, widen_days=widen_days)
+        parse_bookeo_marker(rec["interfaceAccountId"], venue)
+        for rec in iter_events(client, start, end, venue=venue, widen_days=widen_days)
     }
 
 
-def rebuild_id_map(client, start, end, path=None, widen_days=1):
+def rebuild_id_map(client, start, end, venue=DEFAULT_VENUE, path=None, widen_days=1):
     """
-    Reconstruct event_id_map.json entirely from SCS for the window and
-    return the IdMap. Use when the local cache is lost or suspect.
+    Reconstruct the venue's event_id_map file entirely from SCS for the
+    window and return the IdMap. Use when the local cache is lost or suspect.
 
     Records site_unique_id = the Event uniqueId (authoritative, from SCS),
     confirmation_number = the Event Number, status = the lifecycle state
@@ -151,11 +153,11 @@ def rebuild_id_map(client, start, end, path=None, widen_days=1):
     from id_map import IdMap
 
     if path is None:
-        from push_events import DEFAULT_EVENT_ID_MAP_PATH
+        from push_events import id_map_path
 
-        path = DEFAULT_EVENT_ID_MAP_PATH
+        path = id_map_path(venue)
     id_map = IdMap(path=path)
-    index = migrated_event_index(client, start, end, widen_days=widen_days)
+    index = migrated_event_index(client, start, end, venue=venue, widen_days=widen_days)
     for booking_number, info in index.items():
         id_map.record(
             booking_number,

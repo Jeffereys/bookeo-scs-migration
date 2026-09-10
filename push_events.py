@@ -20,15 +20,20 @@ double-booking the "Bowling Lanes" Location -- SCS's own maxConcurrentEvents
 cap on that Location (24, per a live pull on 2026-08-26) is the only
 backstop.
 
-Idempotency is anchored in SCS, not in a local file. Every Event this
-module creates carries function.event.interfaceAccountId = "BKO:<bookingNumber>"
+Multi-venue: one Bookeo account per Alley Cats venue (see transform.VENUES).
+Every command takes a `venue` argument; each venue pulls from its own Bookeo
+credentials ({prefix}_API_KEY / {prefix}_SECRET_KEY) and keeps its own
+idempotency cache (event_id_map.<venue>.json). SCS is one gateway agent with
+cross-site access.
+
+Idempotency is anchored in SCS, not in a local file. Every Event this module
+creates carries function.event.interfaceAccountId = "<venue prefix><bookingNumber>"
 (transform.bookeo_marker); event_lookup.py reads those markers back through
 the BookeoMigration_Lookup Get Request. run_push_events() sweeps the target
 window up front and skips any booking already present in SCS, so a lost or
-stale event_id_map.json can't cause a duplicate -- and event_lookup.rebuild_id_map()
-reconstructs the file from SCS. event_id_map.json is kept as a fast-path
-cache / audit log (confirmation_number = Event Number, site_unique_id =
-Event uniqueId).
+stale cache can't cause a duplicate -- and event_lookup.rebuild_id_map()
+reconstructs the file from SCS. The cache is a fast-path / audit log
+(confirmation_number = Event Number, site_unique_id = Event uniqueId).
 """
 
 import os
@@ -37,10 +42,41 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bookeo"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Reserve"))
 
-from transform import transform_booking_to_event
+from transform import transform_booking_to_event, get_venue, DEFAULT_VENUE, VENUES
 from id_map import IdMap
 
-DEFAULT_EVENT_ID_MAP_PATH = os.path.join(os.path.dirname(__file__), "event_id_map.json")
+_HERE = os.path.dirname(__file__)
+
+
+def id_map_path(venue):
+    """Path to a venue's committed idempotency cache."""
+    return os.path.join(_HERE, venue.id_map_filename)
+
+
+def bookeo_client(venue):
+    """A BookeoAPI bound to `venue`'s credentials. Raises if they're unset --
+    BookeoAPI would otherwise silently fall back to the bare BOOKEO_* vars
+    (Burleson's), which would pull the wrong account."""
+    from bookeo_api import BookeoAPI
+
+    api_key = os.getenv(f"{venue.bookeo_env_prefix}_API_KEY")
+    secret_key = os.getenv(f"{venue.bookeo_env_prefix}_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise RuntimeError(
+            f"no Bookeo credentials for {venue.key}: set "
+            f"{venue.bookeo_env_prefix}_API_KEY and {venue.bookeo_env_prefix}_SECRET_KEY"
+        )
+    return BookeoAPI(api_key=api_key, secret_key=secret_key)
+
+
+def venue_has_credentials(venue):
+    return bool(
+        os.getenv(f"{venue.bookeo_env_prefix}_API_KEY")
+        and os.getenv(f"{venue.bookeo_env_prefix}_SECRET_KEY")
+    )
+
+
+DEFAULT_EVENT_ID_MAP_PATH = id_map_path(DEFAULT_VENUE)  # legacy alias
 
 
 class EventPushError(Exception):
@@ -92,29 +128,36 @@ def push_event_booking(events_api, id_map, transformed, mode="test"):
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
-def run_push_events(start_time, end_time, limit=5, mode="test"):
+def run_push_events(venue, start_time, end_time, limit=5, mode="test"):
     """
-    End-to-end driver: pull up to `limit` real Bookeo bookings in
-    [start_time, end_time) (max 31 days apart, per Bookeo's own limit),
-    transform each, and push as SCS Events. Before pushing anything it
-    sweeps SCS for the same window (event_lookup.migrated_booking_numbers)
+    End-to-end driver for one venue: pull up to `limit` real Bookeo bookings
+    in [start_time, end_time) (max 31 days apart, per Bookeo's own limit),
+    transform each, and push as SCS Events. Before pushing anything it sweeps
+    SCS for the same window + venue (event_lookup.migrated_booking_numbers)
     and skips every booking already present there -- that's the real
-    idempotency guard; event_id_map.json is just a fast-path cache on top.
-    mode="test" (the default) validates every row without creating
-    anything; only pass mode="apply" once every row comes back clean.
+    idempotency guard; the cache file is a fast-path on top. mode="test"
+    (the default) validates every row without creating anything; only pass
+    mode="apply" once every row comes back clean.
+
+    Returns without doing anything (exit 0) if the venue has no Bookeo
+    credentials in the environment -- lets the scheduled workflow list every
+    venue and quietly skip the ones not launched yet.
     """
-    from bookeo_api import BookeoAPI
+    if not venue_has_credentials(venue):
+        print(f"SKIP {venue.key}: no {venue.bookeo_env_prefix}_API_KEY / _SECRET_KEY set")
+        return
+
     from scs_gateway import SCSGatewayClient, SCSGatewayError
     from events import EventsAPI
     from event_lookup import migrated_booking_numbers
 
-    bookeo = BookeoAPI()
+    bookeo = bookeo_client(venue)
     client = SCSGatewayClient()
     events_api = EventsAPI(client)
-    id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
+    id_map = IdMap(path=id_map_path(venue))
 
-    already_in_scs = migrated_booking_numbers(client, start_time, end_time)
-    print(f"SCS already has {len(already_in_scs)} migrated booking(s) in this window")
+    already_in_scs = migrated_booking_numbers(client, start_time, end_time, venue)
+    print(f"[{venue.key}] SCS already has {len(already_in_scs)} migrated booking(s) in this window")
 
     bookings = bookeo.get_bookings(start_time=start_time, end_time=end_time)["data"][:limit]
 
@@ -140,7 +183,7 @@ def run_push_events(start_time, end_time, limit=5, mode="test"):
 
         customer = bookeo.get_customer(booking["customerId"])
         try:
-            transformed = transform_booking_to_event(booking, customer)
+            transformed = transform_booking_to_event(booking, customer, venue)
             result = push_event_booking(events_api, id_map, transformed, mode=mode)
         except (EventPushError, ValueError, SCSGatewayError) as exc:
             print(f"FAILED {booking_number}: {exc}")
@@ -152,34 +195,36 @@ def run_push_events(start_time, end_time, limit=5, mode="test"):
             print(f"pushed {booking_number} [{result['status']}] -> {result.get('uniqueIds')}")
 
 
-def rebuild_event_id_map(start, end):
-    """CLI helper: reconstruct event_id_map.json from SCS for a date window
-    (MM/DD/YYYY or ISO). Use after losing/doubting the local cache. Only
-    picks up Events that carry a BKO: marker -- run backfill_interface_markers
-    first if any pre-marker Events are still in play."""
+def rebuild_event_id_map(venue, start, end):
+    """CLI helper: reconstruct a venue's event_id_map.<venue>.json from SCS
+    for a date window (MM/DD/YYYY or ISO). Use after losing/doubting the
+    local cache. Only picks up Events that carry this venue's marker prefix
+    -- run backfill_interface_markers first if any pre-marker Events are
+    still in play."""
     from scs_gateway import SCSGatewayClient
     from event_lookup import rebuild_id_map
 
-    id_map = rebuild_id_map(SCSGatewayClient(), start, end, path=DEFAULT_EVENT_ID_MAP_PATH)
-    print(f"event_id_map.json rebuilt from SCS: {len(id_map)} entr(y/ies)")
+    id_map = rebuild_id_map(SCSGatewayClient(), start, end, venue=venue, path=id_map_path(venue))
+    print(f"{venue.id_map_filename} rebuilt from SCS: {len(id_map)} entr(y/ies)")
 
 
-def backfill_interface_markers(mode="test"):
+def backfill_interface_markers(venue=DEFAULT_VENUE, mode="test"):
     """
-    One-time: stamp event.interfaceAccountId = "BKO:<bookingNumber>" onto
-    the Events that were migrated before the marker existed (every entry in
-    event_id_map.json -- the 44+ from the 2026-08-27/30 runs carry no
-    marker in SCS, so rebuild_id_map() and the run_push_events sweep can't
-    see them). Uses EventUpdate keyed on the cached Event uniqueId.
-    Idempotent: EventUpdate returns "Merged" and re-running is harmless.
-    mode="test" validates only; pass mode="apply" once test is clean.
+    One-time: stamp event.interfaceAccountId = the venue marker onto the
+    Events that were migrated before the marker existed (every entry in the
+    venue's cache -- the 44+ Burleson Events from the 2026-08-27/30 runs
+    carry no marker in SCS, so rebuild_id_map() and the run_push_events
+    sweep can't see them). Uses EventUpdate keyed on the cached Event
+    uniqueId. Idempotent: EventUpdate returns "Merged" and re-running is
+    harmless. mode="test" validates only; pass mode="apply" once test is
+    clean.
     """
     from scs_gateway import SCSGatewayClient, SCSGatewayError
     from events import EventsAPI
     from transform import bookeo_marker
 
     events_api = EventsAPI(SCSGatewayClient())
-    id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
+    id_map = IdMap(path=id_map_path(venue))
 
     ok = failed = 0
     for booking_number, entry in sorted(id_map.all().items()):
@@ -190,7 +235,9 @@ def backfill_interface_markers(mode="test"):
             continue
         try:
             r = events_api.update_event(
-                event_uid, {"event.interfaceAccountId": bookeo_marker(booking_number)}, mode=mode
+                event_uid,
+                {"event.interfaceAccountId": bookeo_marker(booking_number, venue)},
+                mode=mode,
             )["results"][0]
         except (SCSGatewayError, KeyError, IndexError) as exc:
             print(f"FAILED {booking_number} ({event_uid}): {exc}")
@@ -213,14 +260,14 @@ def _status_already_processed(messages):
     return any("already processed" in (m or "").lower() for m in (messages or []))
 
 
-def backfill_event_type_and_status(mode="test"):
+def backfill_event_type_and_status(venue=DEFAULT_VENUE, mode="test"):
     """
-    One-time: bring already-migrated Events onto the current EVENT_TYPE /
-    EVENT_SALESPERSON_USERNAME / EVENT_STATUS (see transform.py). Events
-    pushed 2026-08-27..2026-09-09 were created as status "Option Hold 5",
-    with no Event Type and the gateway agent as salesperson; this sets
-    event.eventType, event.salesperson.username, and
-    event.lifecycleState.stateType on every entry in event_id_map.json,
+    One-time: bring a venue's already-migrated Events onto the current
+    EVENT_TYPE / EVENT_SALESPERSON_USERNAME / EVENT_STATUS (see transform.py).
+    Burleson Events pushed 2026-08-27..2026-09-09 were created as status
+    "Option Hold 5", with no Event Type and the gateway agent as salesperson;
+    this sets event.eventType, event.salesperson.username, and
+    event.lifecycleState.stateType on every entry in the venue's cache,
     keyed on the cached Event uniqueId.
 
     Type + salesperson go in one EventUpdate call, status in a second: an
@@ -237,7 +284,7 @@ def backfill_event_type_and_status(mode="test"):
     from transform import EVENT_TYPE, EVENT_STATUS, EVENT_SALESPERSON_USERNAME
 
     events_api = EventsAPI(SCSGatewayClient())
-    id_map = IdMap(path=DEFAULT_EVENT_ID_MAP_PATH)
+    id_map = IdMap(path=id_map_path(venue))
 
     def _update(event_uid, fields):
         try:
@@ -284,8 +331,10 @@ if __name__ == "__main__":
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    _venues = sorted(VENUES)
 
     push_cmd = sub.add_parser("push", help="Pull Bookeo bookings in a window and push them as SCS Events")
+    push_cmd.add_argument("venue", choices=_venues)
     push_cmd.add_argument("start_time", help="Bookeo ISO8601 window start, e.g. 2026-08-21T00:00:00Z")
     push_cmd.add_argument("end_time", help="Bookeo ISO8601 window end (max 31 days after start)")
     push_cmd.add_argument("--limit", type=int, default=5)
@@ -296,15 +345,17 @@ if __name__ == "__main__":
     )
 
     rebuild_cmd = sub.add_parser(
-        "rebuild", help="Reconstruct event_id_map.json from SCS for a date window"
+        "rebuild", help="Reconstruct a venue's event_id_map.<venue>.json from SCS for a date window"
     )
+    rebuild_cmd.add_argument("venue", choices=_venues)
     rebuild_cmd.add_argument("start", help="window start, MM/DD/YYYY or ISO8601")
     rebuild_cmd.add_argument("end", help="window end, MM/DD/YYYY or ISO8601")
 
     backfill_cmd = sub.add_parser(
         "backfill-markers",
-        help="One-time: stamp BKO: markers onto Events migrated before the marker existed",
+        help="One-time: stamp venue markers onto Events migrated before the marker existed",
     )
+    backfill_cmd.add_argument("venue", choices=_venues)
     backfill_cmd.add_argument("--apply", action="store_true", help="Actually write (default is test)")
 
     backfill_ts_cmd = sub.add_parser(
@@ -312,14 +363,17 @@ if __name__ == "__main__":
         help="One-time: set Event Type + salesperson + status on already-migrated Events "
              "(EVENT_TYPE / EVENT_SALESPERSON_USERNAME / EVENT_STATUS)",
     )
+    backfill_ts_cmd.add_argument("venue", choices=_venues)
     backfill_ts_cmd.add_argument("--apply", action="store_true", help="Actually write (default is test)")
 
     args = parser.parse_args()
+    venue = get_venue(args.venue)
     if args.command == "push":
-        run_push_events(args.start_time, args.end_time, limit=args.limit, mode="apply" if args.apply else "test")
+        run_push_events(venue, args.start_time, args.end_time, limit=args.limit,
+                        mode="apply" if args.apply else "test")
     elif args.command == "rebuild":
-        rebuild_event_id_map(args.start, args.end)
+        rebuild_event_id_map(venue, args.start, args.end)
     elif args.command == "backfill-markers":
-        backfill_interface_markers(mode="apply" if args.apply else "test")
+        backfill_interface_markers(venue, mode="apply" if args.apply else "test")
     elif args.command == "backfill-type-status":
-        backfill_event_type_and_status(mode="apply" if args.apply else "test")
+        backfill_event_type_and_status(venue, mode="apply" if args.apply else "test")
