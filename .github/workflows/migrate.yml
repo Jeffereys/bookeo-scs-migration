@@ -31,7 +31,7 @@ name: Migrate Bookeo bookings
 
 on:
   schedule:
-    - cron: "17 9,15,16,17,18,19,21 * * *" # daily, 09:17 UTC
+    - cron: "17 9,15,16,17,18,19,20,21,22 * * *" # daily, 09:17 UTC,3,4,5,6,7
   workflow_dispatch:
     inputs:
       apply:
